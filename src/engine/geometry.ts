@@ -7,7 +7,12 @@ export interface RawFeature {
   geometryType: GeometryType;
   segments: number[][][];
   attributes: Record<string, string | number>;
+  /** Index of the source dataset this feature was read from. Multi-file imports
+   *  merge several datasets into one job, each with its own coordinate system. */
+  source?: number;
 }
+
+export type CoordinateTransform = (c: number[]) => number[];
 
 export function makeTransformer(prjOrEpsg: string | null): ((c: number[]) => number[]) | null {
   if (!prjOrEpsg) return null;
@@ -69,16 +74,22 @@ export function buildRoutes(
   raws: RawFeature[],
   idField: string,
   nameField: string,
-  transform: ((c: number[]) => number[]) | null,
+  /** One transform for the whole set, or one per dataset indexed by `raw.source`.
+   *  A `null` entry means that dataset is already in WGS84. */
+  transform: CoordinateTransform | (CoordinateTransform | null)[] | null,
   onProgress?: (done: number, total: number, current: string) => void
 ): RouteFeature[] {
   const out: RouteFeature[] = [];
   const total = raws.length;
   const pad = String(total).length < 3 ? 3 : String(total).length;
+  const perSource = Array.isArray(transform);
   for (let i = 0; i < total; i++) {
     const raw = raws[i];
+    const transformFor = perSource
+      ? transform[raw.source ?? 0] || null
+      : (transform as CoordinateTransform | null);
     let segs = raw.segments;
-    if (transform) segs = segs.map((s) => s.map((c) => transform(c)));
+    if (transformFor) segs = segs.map((s) => s.map((c) => transformFor(c)));
     segs = segs.map((s) => s.filter((c) => Number.isFinite(c[0]) && Number.isFinite(c[1])));
 
     const segmentLengths = segs.map((s) => segmentLength(s));

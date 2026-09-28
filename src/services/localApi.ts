@@ -1,4 +1,4 @@
-import type { GeometryType, ImportResult, RouteFeature } from '../types';
+import type { FileKind, GeometryType, ImportResult, ImportSource, RouteFeature } from '../types';
 import { parseKmlText, parseKmz } from '../engine/kml';
 import { parseShapefile } from '../engine/shapefile';
 import { parseMapInfo } from '../engine/mapinfo';
@@ -25,46 +25,118 @@ export async function pingEngine(signal?: AbortSignal): Promise<boolean> {
 }
 
 export interface FileGroup {
-  kind: 'kml' | 'kmz' | 'shapefile' | 'mapinfo';
+  kind: FileKind;
   name: string;
   parts: Record<string, File>;
   missing: string[];
 }
 
+/** Sidecar parts of one shapefile, matched to their .shp by file-name stem. */
+const SHP_PARTS = ['shp', 'shx', 'dbf', 'prj', 'cpg'];
 const SHP_REQUIRED = ['shp', 'shx', 'dbf'];
+/** Native MapInfo tabular set. */
+const TAB_PARTS = ['tab', 'dat', 'map', 'id'];
 const TAB_REQUIRED = ['tab'];
+/** MapInfo interchange set. */
+const MIF_PARTS = ['mif', 'mid'];
 
-export function groupFiles(files: File[]): { group: FileGroup | null; error: string | null } {
-  if (!files.length) return { group: null, error: null };
-  const parts: Record<string, File> = {};
-  for (const f of files) {
-    const ext = f.name.split('.').pop()?.toLowerCase() || '';
-    parts[ext] = f;
-  }
-  const base = files[0].name.replace(/\.[^.]+$/, '');
+const SUPPORTED_EXTENSIONS = new Set([
+  'kml',
+  'kmz',
+  ...SHP_PARTS,
+  ...TAB_PARTS,
+  ...MIF_PARTS,
+]);
 
-  if (parts.kmz) return { group: { kind: 'kmz', name: parts.kmz.name, parts, missing: [] }, error: null };
-  if (parts.kml) return { group: { kind: 'kml', name: parts.kml.name, parts, missing: [] }, error: null };
-  if (parts.shp) {
-    const missing = SHP_REQUIRED.filter((e) => !parts[e]);
-    return { group: { kind: 'shapefile', name: base, parts, missing }, error: null };
-  }
-  if (parts.tab || parts.mif) {
-    const missing = parts.mif ? [] : TAB_REQUIRED.filter((e) => !parts[e]);
-    return { group: { kind: 'mapinfo', name: base, parts, missing }, error: null };
-  }
-  return {
-    group: null,
-    error: 'Unsupported file format. Supported inputs: KML, KMZ, SHP (+SHX/DBF/PRJ), TAB / MIF.',
-  };
+const UNSUPPORTED_MESSAGE =
+  'Supported inputs: KML, KMZ, SHP (+SHX/DBF/PRJ/CPG), TAB (+DAT/MAP/ID), MIF (+MID).';
+
+function extOf(name: string): string {
+  return (name.split('.').pop() || '').toLowerCase();
 }
 
-interface CacheEntry {
+function stemOf(name: string): string {
+  return name.replace(/\.[^.]+$/, '').toLowerCase();
+}
+
+/** Split a flat file selection into one group per dataset. Every KML/KMZ is its
+ *  own dataset; shapefile and MapInfo sidecars are matched to their dataset by
+ *  file-name stem, so several datasets can be dropped together. */
+export function groupFiles(files: File[]): { groups: FileGroup[]; errors: string[] } {
+  const errors: string[] = [];
+  const buckets = new Map<string, { group: FileGroup; seen: Set<string> }>();
+  const order: string[] = [];
+
+  const openBucket = (key: string, kind: FileKind, name: string) => {
+    let entry = buckets.get(key);
+    if (!entry) {
+      entry = { group: { kind, name, parts: {}, missing: [] }, seen: new Set() };
+      buckets.set(key, entry);
+      order.push(key);
+    }
+    return entry;
+  };
+
+  for (const file of files) {
+    const ext = extOf(file.name);
+    if (!SUPPORTED_EXTENSIONS.has(ext)) {
+      errors.push(`${file.name} was skipped — unsupported format. ${UNSUPPORTED_MESSAGE}`);
+      continue;
+    }
+
+    if (ext === 'kml' || ext === 'kmz') {
+      const entry = openBucket(`doc:${stemOf(file.name)}`, ext, file.name);
+      entry.group.parts[ext] = file;
+      entry.seen.add(ext);
+      continue;
+    }
+
+    const kind: FileKind = SHP_PARTS.includes(ext) ? 'shapefile' : 'mapinfo';
+    const stem = stemOf(file.name);
+    const entry = openBucket(`${kind}:${stem}`, kind, stem);
+    entry.group.parts[ext] = file;
+    entry.seen.add(ext);
+  }
+
+  const groups: FileGroup[] = [];
+  for (const key of order) {
+    const { group, seen } = buckets.get(key)!;
+    const required =
+      group.kind === 'shapefile'
+        ? SHP_REQUIRED
+        : group.kind === 'mapinfo'
+          ? seen.has('mif')
+            ? ['mif']
+            : TAB_REQUIRED
+          : [];
+    group.missing = required.filter((ext) => !seen.has(ext));
+    if (group.missing.length) {
+      errors.push(
+        `“${group.name}” was skipped — incomplete ${group.kind === 'shapefile' ? 'shapefile' : 'MapInfo'} dataset, missing ${group.missing
+          .map((m) => '.' + m)
+          .join(', ')}.`
+      );
+      continue;
+    }
+    groups.push(group);
+  }
+
+  return { groups, errors };
+}
+
+interface Dataset {
+  name: string;
+  kind: FileKind;
+  fileNames: string[];
   raws: RawFeature[];
-  fields: string[];
   crs: string;
   crsDetected: boolean;
   crsDef: string | null;
+}
+
+interface CacheEntry {
+  datasets: Dataset[];
+  fields: string[];
 }
 const cache = new Map<string, CacheEntry>();
 
@@ -72,14 +144,7 @@ export function discardJob(jobId: string): void {
   cache.delete(jobId);
 }
 
-export async function importRouteFile(group: FileGroup): Promise<ImportResult> {
-  if (group.missing.length)
-    throw new Error(
-      `Invalid ${group.kind === 'shapefile' ? 'Shapefile' : 'MapInfo dataset'}: missing ${group.missing
-        .map((m) => '.' + m)
-        .join(', ')}`
-    );
-
+async function readDataset(group: FileGroup): Promise<Dataset & { fields: string[]; warnings: string[] }> {
   let raws: RawFeature[] = [];
   let fields: string[] = [];
   let crs = 'WGS84 / EPSG:4326';
@@ -115,22 +180,100 @@ export async function importRouteFile(group: FileGroup): Promise<ImportResult> {
     crsDef = r.crsDef;
   }
 
-  if (!raws.length) throw new Error('No route geometry found in this file.');
+  return {
+    name: group.name,
+    kind: group.kind,
+    fileNames: Object.values(group.parts).map((f) => f.name),
+    raws,
+    fields,
+    crs,
+    crsDetected,
+    crsDef,
+    warnings,
+  };
+}
 
+/** Read and merge any number of datasets into a single import session. Each
+ *  dataset keeps its own coordinate system, reprojected independently later. */
+export async function importRouteFiles(
+  groups: FileGroup[],
+  onProgress?: (done: number, total: number, current: string) => void
+): Promise<ImportResult> {
+  if (!groups.length) throw new Error(`No importable dataset in this selection. ${UNSUPPORTED_MESSAGE}`);
+
+  const warnings: string[] = [];
+  const datasets: Dataset[] = [];
+  const fieldSet = new Set<string>();
+
+  for (let i = 0; i < groups.length; i++) {
+    const group = groups[i];
+    onProgress?.(i, groups.length, group.name);
+    let dataset: Dataset & { fields: string[]; warnings: string[] };
+    try {
+      dataset = await readDataset(group);
+    } catch (e) {
+      warnings.push(`“${group.name}” was skipped — ${(e as Error).message}`);
+      continue;
+    }
+    if (!dataset.raws.length) {
+      warnings.push(`“${group.name}” was skipped — no route geometry found in this dataset.`);
+      continue;
+    }
+    dataset.fields.forEach((f) => fieldSet.add(f));
+    dataset.warnings.forEach((w) => warnings.push(`“${dataset.name}”: ${w}`));
+    datasets.push(dataset);
+    // Yield between datasets so the progress bar repaints for large selections.
+    await new Promise((r) => setTimeout(r, 0));
+  }
+  onProgress?.(groups.length, groups.length, '');
+
+  if (!datasets.length) {
+    // Surface why each dataset was dropped rather than a bare "nothing found".
+    const detail = warnings.length ? ' ' + warnings.join(' ') : '';
+    throw new Error(`No route geometry found in the selected file(s).${detail}`);
+  }
+
+  const raws: RawFeature[] = [];
   const geometryTypes: Record<string, number> = {};
-  for (const r of raws) geometryTypes[r.geometryType] = (geometryTypes[r.geometryType] || 0) + 1;
-  const nonRouteCount = raws.filter((r) => !isRouteGeometry(r.geometryType)).length;
+  const sources: ImportSource[] = [];
+  let nonRouteCount = 0;
+
+  for (let i = 0; i < datasets.length; i++) {
+    const dataset = datasets[i];
+    for (const raw of dataset.raws) {
+      raw.source = i;
+      raws.push(raw);
+      geometryTypes[raw.geometryType] = (geometryTypes[raw.geometryType] || 0) + 1;
+    }
+    const nonRoute = dataset.raws.filter((r) => !isRouteGeometry(r.geometryType)).length;
+    nonRouteCount += nonRoute;
+    sources.push({
+      name: dataset.name,
+      kind: dataset.kind,
+      fileNames: dataset.fileNames,
+      featureCount: dataset.raws.length,
+      nonRouteCount: nonRoute,
+      crs: dataset.crs,
+      crsDetected: dataset.crsDetected,
+    });
+  }
+  const crsLabels = Array.from(new Set(datasets.map((d) => d.crs)));
+  const crs =
+    crsLabels.length === 1
+      ? crsLabels[0]
+      : `${crsLabels.length} coordinate systems across ${datasets.length} datasets`;
 
   const jobId = `job_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
-  cache.set(jobId, { raws, fields, crs, crsDetected, crsDef });
+  cache.set(jobId, { datasets, fields: Array.from(fieldSet) });
 
   return {
     jobId,
-    fileName: group.name,
-    fileKinds: Object.keys(group.parts),
+    fileName: datasets.length === 1 ? datasets[0].name : `${datasets.length} datasets`,
+    fileKinds: datasets.map((d) => d.kind),
+    sources,
     crs,
-    crsDetected,
-    fields,
+    crsDetected: datasets.every((d) => d.crsDetected),
+    fields: Array.from(fieldSet),
     routes: [],
     geometryTypes: geometryTypes as Record<GeometryType, number>,
     warnings,
@@ -152,25 +295,32 @@ export async function calculateDistances(
   signal?: AbortSignal
 ): Promise<{ routes: RouteFeature[]; warnings: string[] }> {
   const entry = cache.get(jobId);
-  if (!entry) throw new Error('This import session has expired. Please re-import the file.');
+  if (!entry) throw new Error('This import session has expired. Please re-import the file(s).');
 
-  const transform = makeTransformer(opts.crsOverride ?? entry.crsDef);
-  const source = opts.includeNonRoute
-    ? entry.raws
-    : entry.raws.filter((r) => isRouteGeometry(r.geometryType));
-  if (!source.length) throw new Error('No route (line) geometry found in this file.');
+  // Every dataset carries its own coordinate system, so build one transform each.
+  const override = opts.crsOverride?.trim() ? opts.crsOverride : null;
+  const transforms = entry.datasets.map((d) => makeTransformer(override || d.crsDef));
+  const labels = entry.datasets.map((d) => d.name);
+
+  const source = entry.datasets.flatMap((d) =>
+    opts.includeNonRoute ? d.raws : d.raws.filter((r) => isRouteGeometry(r.geometryType))
+  );
+  if (!source.length) throw new Error('No route (line) geometry found in the selected file(s).');
 
   // Chunked processing keeps the UI responsive, mirroring the Go worker pool.
   const routes: RouteFeature[] = [];
   const CHUNK = 500;
+  const pad = String(source.length).length < 3 ? 3 : String(source.length).length;
   for (let start = 0; start < source.length; start += CHUNK) {
     if (signal?.aborted) throw new DOMException('Calculation cancelled.', 'AbortError');
     const slice = source.slice(start, start + CHUNK);
-    const built = buildRoutes(slice, opts.idField, opts.nameField, transform);
+    const built = buildRoutes(slice, opts.idField, opts.nameField, transforms);
     built.forEach((b, i) => {
-      b.idx = start + i;
-      if (/^ROUTE\d+$/.test(b.routeId))
-        b.routeId = 'ROUTE' + String(start + i + 1).padStart(3, '0');
+      const at = start + i;
+      b.idx = at;
+      b.source = labels[slice[i].source ?? 0] || '';
+      // Renumber auto-ids globally so merged datasets never collide.
+      if (/^ROUTE\d+$/.test(b.routeId)) b.routeId = 'ROUTE' + String(at + 1).padStart(pad, '0');
       if (/^ROUTE\d+$/.test(b.routeName)) b.routeName = b.routeId;
       routes.push(b);
     });
@@ -189,6 +339,18 @@ export async function calculateDistances(
   const empty = routes.filter((r) => r.empty).length;
   if (invalid) warnings.push(`${invalid} route${invalid > 1 ? 's' : ''} contain invalid geometry`);
   if (empty) warnings.push(`${empty} route${empty > 1 ? 's' : ''} contain empty geometry`);
+
+  // Merged datasets frequently repeat route ids; flag them so the export is auditable.
+  const seenIds = new Set<string>();
+  let duplicateIds = 0;
+  for (const route of routes) {
+    if (seenIds.has(route.routeId)) duplicateIds++;
+    else seenIds.add(route.routeId);
+  }
+  if (duplicateIds)
+    warnings.push(
+      `${duplicateIds} route ID${duplicateIds > 1 ? 's are' : ' is'} duplicated across the selected files`
+    );
 
   return { routes, warnings };
 }

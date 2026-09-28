@@ -13,13 +13,13 @@ import FileUploader from './components/FileUploader';
 import MapView from './components/MapView';
 import SummaryCards from './components/SummaryCards';
 import { buildXlsx, download } from './engine/exporters';
-import type { ImportResult, ProgressState, RouteFeature, Unit } from './types';
+import type { ImportResult, ImportSource, ProgressState, RouteFeature, Unit } from './types';
 import {
   calculateDistances,
   defaultFields,
   discardJob,
   groupFiles,
-  importRouteFile,
+  importRouteFiles,
   sampleKml,
 } from './services/localApi';
 import { routesToGeoJSON } from './engine/geometry';
@@ -50,6 +50,7 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [errorSection, setErrorSection] = useState<'source' | 'calculate' | null>(null);
   const [warnings, setWarnings] = useState<string[]>([]);
+  const [skipped, setSkipped] = useState<string[]>([]);
   const [progress, setProgress] = useState<ProgressState>(INITIAL_PROGRESS);
   const [exportingExcel, setExportingExcel] = useState(false);
   const [fitToken, setFitToken] = useState(0);
@@ -72,6 +73,8 @@ export default function App() {
   const workVersion = useRef(0);
   const activeJobId = useRef<string | null>(null);
   const calculation = useRef<AbortController | null>(null);
+  // Files backing the current import, so more datasets can be merged in later.
+  const importedFiles = useRef<File[]>([]);
 
   const invalidateWork = () => {
     workVersion.current += 1;
@@ -81,9 +84,11 @@ export default function App() {
     activeJobId.current = null;
   };
 
-  const handleFiles = async (files: File[]) => {
+  const handleFiles = async (files: File[], append = false) => {
     invalidateWork();
     const version = workVersion.current;
+    const selection = append ? [...importedFiles.current, ...files] : files;
+    importedFiles.current = selection;
     setQuery('');
     setDebouncedQuery('');
     setSearchField(ALL_COLUMNS);
@@ -91,14 +96,16 @@ export default function App() {
     setError(null);
     setErrorSection(null);
     setWarnings([]);
+    setSkipped([]);
     setRoutes([]);
     setSelectedIdx(null);
     setFitToken((value) => value + 1);
-    const { group: fileGroup, error: groupError } = groupFiles(files);
-    if (groupError || !fileGroup) {
+    const { groups, errors } = groupFiles(selection);
+    if (!groups.length) {
+      importedFiles.current = [];
       setImported(null);
       setProgress(INITIAL_PROGRESS);
-      setError(groupError || 'Unsupported file format.');
+      setError(errors[0] || 'Unsupported file format.');
       setErrorSection('source');
       return;
     }
@@ -106,13 +113,24 @@ export default function App() {
     setImported(null);
     setProgress({ ...INITIAL_PROGRESS, active: true, phase: 'Reading routes...', percent: 15 });
     try {
-      const result = await importRouteFile(fileGroup);
+      const result = await importRouteFiles(groups, (done, total, current) => {
+        if (version !== workVersion.current) return;
+        setProgress({
+          active: true,
+          phase: total > 1 ? `Reading ${current || 'routes'} — file ${done + 1} of ${total}` : 'Reading routes...',
+          percent: Math.round((Math.min(done + 1, total) / total) * 100),
+          done: done + 1,
+          total,
+          current,
+        });
+      });
       if (version !== workVersion.current) {
         discardJob(result.jobId);
         return;
       }
       activeJobId.current = result.jobId;
       setImported(result);
+      setSkipped(errors);
       const defaults = defaultFields(result.fields);
       setIdField(defaults.idField);
       setNameField(defaults.nameField);
@@ -120,6 +138,7 @@ export default function App() {
       setWarnings(result.warnings);
     } catch (e) {
       if (version !== workVersion.current) return;
+      importedFiles.current = [];
       setImported(null);
       setError((e as Error).message);
       setErrorSection('source');
@@ -179,8 +198,7 @@ export default function App() {
     try {
       const blob = await buildXlsx(routes, imported?.fields ?? [], unit);
       if (version !== workVersion.current) return;
-      const baseName = (imported?.fileName ?? 'routes').replace(/\.[^.]+$/, '');
-      download(blob, `${baseName}_distances_${unit}.xlsx`);
+      download(blob, `${exportBase}_distances_${unit}.xlsx`);
     } catch {
       if (version !== workVersion.current) return;
       setError('Unable to create the Excel file. Please try again.');
@@ -297,6 +315,12 @@ export default function App() {
     />
   );
   const totalM = useMemo(() => routes.reduce((sum, route) => sum + route.lengthM, 0), [routes]);
+  // A single dataset keeps its own name; a merged import is exported as one workbook.
+  const exportBase = imported
+    ? imported.sources.length === 1
+      ? imported.sources[0].name.replace(/\.[^.]+$/, '')
+      : 'routes'
+    : 'routes';
   const nonRouteGeometry = imported
     ? Object.keys(imported.geometryTypes)
         .filter((geometry) => geometry !== 'LineString' && geometry !== 'MultiLineString')
@@ -390,16 +414,24 @@ export default function App() {
 
           <div className="stage-panel min-h-0 flex-1 overflow-y-auto px-5 py-5">
             <section aria-labelledby="route-file-heading" className="space-y-3">
-              <SectionHeading id="route-file-heading" number="01" title="Route file" />
+              <SectionHeading id="route-file-heading" number="01" title="Route files" />
               <FileUploader
                 busy={progress.active}
-                onFiles={handleFiles}
-                onSample={() => handleFiles([sampleKml()])}
+                onFiles={(files) => handleFiles(files, false)}
+                onAdd={(files) => handleFiles(files, true)}
+                canAdd={!!imported && !progress.active}
+                onSample={() => handleFiles([sampleKml()], false)}
               />
               {progress.active && progress.phase.startsWith('Reading') && (
                 <ProgressBar progress={progress} />
               )}
               {error && errorSection === 'source' && <Notice kind="error">{error}</Notice>}
+              {imported && <SourceList sources={imported.sources} />}
+              {skipped.map((note, index) => (
+                <Notice key={index} kind="warning">
+                  {note}
+                </Notice>
+              ))}
               {nonRouteGeometry && (
                 <Notice kind="warning">
                   {nonRouteGeometry} geometry detected. Only lines are measured.
@@ -482,7 +514,7 @@ export default function App() {
               {routes.length > 0 && (
                 <p className="flex items-center justify-center gap-1 text-[10px] text-[#849692]">
                   <Download size={11} aria-hidden="true" />
-                  {(imported?.fileName ?? 'routes').replace(/\.[^.]+$/, '')}_distances_{unit}.xlsx
+                  {(imported ? `${exportBase}_distances_${unit}.xlsx` : `routes_distances_${unit}.xlsx`)}
                 </p>
               )}
             </section>
@@ -639,6 +671,47 @@ function RouteSearch({
         {' / '}
         {totalCount.toLocaleString()} routes
       </span>
+    </div>
+  );
+}
+
+const KIND_LABEL: Record<ImportSource['kind'], string> = {
+  kml: 'KML',
+  kmz: 'KMZ',
+  shapefile: 'SHP',
+  mapinfo: 'TAB',
+};
+
+function SourceList({ sources }: { sources: ImportSource[] }) {
+  const total = sources.reduce((sum, source) => sum + source.featureCount, 0);
+  return (
+    <div className="pfc-source-list" aria-label="Imported datasets">
+      <div className="flex items-center justify-between gap-2 border-b border-[#e6ecea] px-2.5 py-1.5">
+        <span className="text-[9px] font-bold uppercase tracking-[0.08em] text-[#78918b]">
+          {sources.length === 1 ? '1 dataset' : `${sources.length} datasets merged`}
+        </span>
+        <span className="font-mono text-[10px] text-[#6b7f7c]">
+          {total.toLocaleString()} features
+        </span>
+      </div>
+      <ul>
+        {sources.map((source, index) => (
+          <li
+            key={`${source.name}-${index}`}
+            className="pfc-source-row flex items-center justify-between gap-2 px-2.5 py-1.5"
+          >
+            <span className="flex min-w-0 items-center gap-1.5">
+              <span className="pfc-source-kind shrink-0">{KIND_LABEL[source.kind]}</span>
+              <span className="min-w-0 truncate text-[11px] text-[#2e4a47]" title={source.fileNames.join(', ')}>
+                {source.name}
+              </span>
+            </span>
+            <span className="shrink-0 font-mono text-[10px] text-[#6b7f7c]">
+              {source.featureCount.toLocaleString()}
+            </span>
+          </li>
+        ))}
+      </ul>
     </div>
   );
 }

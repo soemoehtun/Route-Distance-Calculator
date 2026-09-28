@@ -8,11 +8,16 @@ export type GeometryType =
 
 export type Unit = 'm' | 'km' | 'ft' | 'mi';
 
+/** Every importable dataset family. One selection may contain several of each. */
+export type FileKind = 'kml' | 'kmz' | 'shapefile' | 'mapinfo';
+
 export interface RouteFeature {
   /** internal index */
   idx: number;
   routeId: string;
   routeName: string;
+  /** Name of the file/dataset this route was read from, when several were merged. */
+  source?: string;
   geometryType: GeometryType;
   /** array of segments, each an array of [lon, lat] */
   segments: number[][][];
@@ -25,10 +30,23 @@ export interface RouteFeature {
   empty?: boolean;
 }
 
+/** One dataset (a single KML/KMZ, or a matched SHP/TAB set) inside an import. */
+export interface ImportSource {
+  name: string;
+  kind: FileKind;
+  /** All files that back this dataset, e.g. routes.shp + routes.shx + routes.dbf. */
+  fileNames: string[];
+  featureCount: number;
+  nonRouteCount: number;
+  crs: string;
+  crsDetected: boolean;
+}
+
 export interface ImportResult {
   jobId: string;
   fileName: string;
   fileKinds: string[];
+  sources: ImportSource[];
   crs: string;
   crsDetected: boolean;
   fields: string[];

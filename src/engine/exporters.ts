@@ -11,6 +11,7 @@ export function buildCsv(routes: RouteFeature[], extraFields: string[]): string 
   const head = [
     'Route_ID',
     'Route_Name',
+    'Source_File',
     'Length_M',
     'Length_KM',
     'Length_Miles',
@@ -24,6 +25,7 @@ export function buildCsv(routes: RouteFeature[], extraFields: string[]): string 
     [
       esc(r.routeId),
       esc(r.routeName),
+      esc(r.source),
       r.lengthM.toFixed(2),
       (r.lengthM / 1000).toFixed(5),
       (r.lengthM / 1609.344).toFixed(5),
@@ -46,6 +48,7 @@ export function buildGeoJson(routes: RouteFeature[]): string {
         properties: {
           Route_ID: r.routeId,
           Route_Name: r.routeName,
+          Source_File: r.source ?? '',
           Length_M: +r.lengthM.toFixed(2),
           Length_KM: +(r.lengthM / 1000).toFixed(5),
           Geometry_Type: r.geometryType,
@@ -83,13 +86,14 @@ export function buildKml(routes: RouteFeature[], unit: Unit, docName: string): s
     const attrLines = Object.entries(r.attributes)
       .map(([k, v]) => `${k}: ${v}`)
       .join('\n');
-    const desc = `Route ID: ${r.routeId}\nRoute Name: ${r.routeName}\nDistance: ${dist}\nGeometry: ${r.geometryType}\nVertices: ${r.vertices}\n${attrLines}`;
+    const desc = `Route ID: ${r.routeId}\nRoute Name: ${r.routeName}\nSource File: ${r.source ?? ''}\nDistance: ${dist}\nGeometry: ${r.geometryType}\nVertices: ${r.vertices}\n${attrLines}`;
     parts.push('<Placemark>');
     parts.push(`<name>${xmlEsc(r.routeName)}</name>`);
     parts.push('<styleUrl>#route</styleUrl>');
     parts.push(`<description><![CDATA[${desc}]]></description>`);
     parts.push('<ExtendedData>');
     parts.push(`<Data name="Route_ID"><value>${xmlEsc(r.routeId)}</value></Data>`);
+    if (r.source) parts.push(`<Data name="Source_File"><value>${xmlEsc(r.source)}</value></Data>`);
     parts.push(`<Data name="Length_M"><value>${r.lengthM.toFixed(2)}</value></Data>`);
     parts.push(`<Data name="Length_KM"><value>${(r.lengthM / 1000).toFixed(5)}</value></Data>`);
     for (const [k, v] of Object.entries(r.attributes))
@@ -156,6 +160,7 @@ export async function buildXlsx(
   const header = [
     'Route_ID',
     'Route_Name',
+    'Source_File',
     LENGTH_HEADER[unit],
     'Geometry_Type',
     'Segments',
@@ -167,6 +172,7 @@ export async function buildXlsx(
     rows.push([
       r.routeId,
       r.routeName,
+      r.source ?? '',
       lengthValue(r.lengthM, unit),
       r.geometryType,
       r.segments.length,
